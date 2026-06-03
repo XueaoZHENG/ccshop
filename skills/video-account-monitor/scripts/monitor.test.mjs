@@ -26,6 +26,12 @@ import {
   normalizeBrowserVideo,
   parseXhsMetric,
 } from "./adapters/xiaohongshu.mjs";
+import {
+  dedupeById,
+  formatDuration,
+  parseMetric,
+  toIso,
+} from "./adapters/_shared/util.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const skillRoot = path.resolve(__dirname, "..");
@@ -205,6 +211,45 @@ try {
   assert.equal(cookies[0].value, "ok");
   assert.equal(await loadCookieHeader(""), "");
   await assert.rejects(() => loadCookieHeader(path.join(tmpRoot, "cookies.json"), ["kuaishou.com"]), /--cookies is no longer supported/);
+
+  // _shared/util.mjs
+  // 1717228800 seconds = 2024-06-01 16:00:00 +08:00
+  assert.equal(toIso(1717228800), "2024-06-01T16:00:00+08:00"); // auto-detect seconds (10 chars)
+  assert.equal(toIso(1717228800000), "2024-06-01T16:00:00+08:00"); // auto-detect ms (13 chars)
+  assert.equal(toIso(1717228800000, { detectMs: false }), "2024-06-01T16:00:00+08:00"); // explicit ms
+  assert.equal(toIso(0), "");
+  assert.equal(toIso(""), "");
+  assert.equal(toIso("not a number"), "");
+
+  // parseMetric: 0 歧义已改为 null
+  assert.equal(parseMetric("1.2万"), 12000);
+  assert.equal(parseMetric("3亿"), 300000000);
+  assert.equal(parseMetric(42), 42);
+  assert.equal(parseMetric(0), 0);
+  assert.equal(parseMetric(null), null);
+  assert.equal(parseMetric(""), null);
+  assert.equal(parseMetric(undefined), null);
+  assert.equal(parseMetric("abc"), null);
+
+  // formatDuration
+  assert.equal(formatDuration(0), "");
+  assert.equal(formatDuration(95000), "01:35");
+  assert.equal(formatDuration(3661000), "01:01:01");
+  assert.equal(formatDuration(undefined), "");
+
+  // dedupeById
+  assert.deepEqual(
+    dedupeById([{ id: "a" }, { id: "b" }, { id: "a" }, { id: "c" }], (x) => x.id).map((x) => x.id),
+    ["a", "b", "c"],
+  );
+  assert.deepEqual(
+    dedupeById([{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }], (x) => x.id, 2).map((x) => x.id),
+    ["a", "b"],
+  );
+  assert.deepEqual(
+    dedupeById([{ id: "" }, { id: "b" }], (x) => x.id).map((x) => x.id),
+    ["b"],
+  );
 } finally {
   await rm(tmpRoot, { recursive: true, force: true });
 }

@@ -182,14 +182,10 @@ function formatNumber(value) {
   return new Intl.NumberFormat("en-US").format(asNumber(value));
 }
 
-function redactSensitiveText(value) {
-  return String(value || "")
-    .replace(/([?&]xsec_token=)[^&\s)]+/gi, "$1REDACTED")
-    .replace(/(%3[FfAa]|[?&,\s\{\[])(xsec_token)(%3[Dd]|=)([^&\s,\}\]]+)/gi, "$1$2$3REDACTED")
-    .replace(/(["']xsec_token["']\s*:\s*["'])[^"']+/gi, "$1REDACTED")
-    .replace(/(Cookie\s*:\s*)[^\r\n]+/gi, "$1REDACTED")
-    .replace(/\b(a1|web_session|sessionid|sid_guard|uid_tt|msToken)=([^;,\s]+)/gi, "$1=REDACTED");
-}
+// redactSensitiveText is defined in scripts/adapters/_shared/util.mjs and re-exported below
+// for backward compatibility with code that imported it from this module.
+import { redactSensitiveText } from "./adapters/_shared/util.mjs";
+export { redactSensitiveText };
 
 function escapeHtml(value) {
   return String(value ?? "")

@@ -142,17 +142,11 @@ const VISION_VIDEO_COMMENT_QUERY = `query commentListQuery($photoId: String, $pc
   }
 }`;
 
-// ── Helpers ──────────────────────────────────────────────────────────
+// ── Shared helpers (jitter/sleep/toIso/parseMetric/formatDuration live in _shared/util.mjs) ──
+import { jitter, sleep, toIso, parseMetric, formatDuration, dedupeById, buildAccountSummary, redactSensitiveText } from "./_shared/util.mjs";
+
 function randItem(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
-}
-
-function jitter(base) {
-  return Math.round(base * (0.7 + Math.random() * 0.6));
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, jitter(ms)));
 }
 
 function extractUserId(account) {
@@ -211,6 +205,26 @@ function generateWebDid() {
   return `web_${hex}`;
 }
 
+// ── Risk-control circuit breaker ──────────────────────────────────────
+// Resets on any successful GraphQL response. After RISK_ABORT_THRESHOLD consecutive
+// 412/403/421 HTTP statuses or `data.errors` responses, the next call throws
+// `RiskControlAbort` instead of retrying. Keeps a sustained ban from burning
+// `200 × 5 retries × ~3s backoff = 50 min` of stuck collection.
+const RISK_ABORT_THRESHOLD = 5;
+let consecutiveRiskControl = 0;
+
+class RiskControlAbort extends Error {
+  constructor(detail) {
+    // Accept either a count (legacy) or a descriptive string. Produces a clear
+    // message for the caller regardless of which path triggered the abort.
+    const tail = typeof detail === "number"
+      ? `${detail} consecutive 412/403/421 responses`
+      : String(detail);
+    super(`Kuaishou risk control abort: ${tail}.`);
+    this.name = "RiskControlAbort";
+  }
+}
+
 // ── Request with retry + exponential backoff ──────────────────────────
 async function graphqlPost(operationName, variables, query, referer, cookieHeader = "", retries = 5) {
   let lastError;
@@ -226,6 +240,10 @@ async function graphqlPost(operationName, variables, query, referer, cookieHeade
       });
 
       if (response.status === 412 || response.status === 403 || response.status === 421) {
+        consecutiveRiskControl += 1;
+        if (consecutiveRiskControl >= RISK_ABORT_THRESHOLD) {
+          throw new RiskControlAbort(consecutiveRiskControl);
+        }
         throw new Error(`HTTP ${response.status}: Kuaishou risk-control ban (retryable)`);
       }
 
@@ -237,8 +255,13 @@ async function graphqlPost(operationName, variables, query, referer, cookieHeade
         throw new Error(`Kuaishou returned non-JSON status=${response.status}: ${text.slice(0, 90)} (retryable)`);
       }
       if (data.errors) {
+        consecutiveRiskControl += 1;
+        if (consecutiveRiskControl >= RISK_ABORT_THRESHOLD) {
+          throw new RiskControlAbort(consecutiveRiskControl);
+        }
         throw new Error(`Kuaishou GraphQL error: ${JSON.stringify(data.errors)} (retryable)`);
       }
+      consecutiveRiskControl = 0;
       return data.data || {};
     } catch (error) {
       lastError = error;
@@ -249,34 +272,6 @@ async function graphqlPost(operationName, variables, query, referer, cookieHeade
     }
   }
   throw lastError;
-}
-
-function toIso(ts) {
-  if (!ts) return "";
-  // Kuaishou timestamps can be in seconds or milliseconds
-  const ms = String(ts).length <= 10 ? ts * 1000 : ts;
-  return new Date(ms + 8 * 3600 * 1000).toISOString().replace(".000Z", "+08:00");
-}
-
-function parseMetric(value) {
-  if (value === null || value === undefined || value === "") return 0;
-  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
-
-  const text = String(value).trim().replace(/,/g, "");
-  const match = text.match(/^([0-9]+(?:\.[0-9]+)?)(万|亿)?$/);
-  if (!match) return 0;
-
-  const number = Number(match[1]);
-  const multiplier = match[2] === "亿" ? 100000000 : match[2] === "万" ? 10000 : 1;
-  return Math.round(number * multiplier);
-}
-
-function formatDuration(ms) {
-  if (!ms) return "";
-  const totalSeconds = Math.floor(Number(ms) / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 async function fetchCommentCount(photoId, cookieHeader, { page = null } = {}) {
@@ -420,8 +415,23 @@ async function searchVideosByCreator({ userId, keyword, cookieHeader, limit, del
 }
 
 // ── Main collect function ────────────────────────────────────────────
+function failAccount(userId, error) {
+  return {
+    account: buildAccountSummary({
+      platform: "kuaishou",
+      id: userId,
+      url: userId ? `https://www.kuaishou.com/profile/${userId}` : "",
+      collectionStatus: "failed",
+      warnings: [`Kuaishou collection aborted: ${error?.message || String(error) || "unknown error"}`],
+    }),
+    videos: [],
+  };
+}
+
 export async function collect({ account, cookieHeader = "", limit, delay = 5000 }) {
-  const userId = extractUserId(account);
+  let userId = "";
+  try {
+  userId = extractUserId(account);
   const profileUrl = `https://www.kuaishou.com/profile/${userId}`;
 
   // 1. Fetch creator profile
@@ -446,7 +456,7 @@ export async function collect({ account, cookieHeader = "", limit, delay = 5000 
   const profile = userProfile.profile || {};
   const ownerCount = userProfile.ownerCount || {};
 
-  const expectedVideoCount = parseMetric(ownerCount.photo_public ?? ownerCount.photo);
+  const expectedVideoCount = parseMetric(ownerCount.photo_public ?? ownerCount.photo) ?? 0;
 
   // 2. Fetch videos (paginated)
   const rawVideos = [];
@@ -519,32 +529,24 @@ export async function collect({ account, cookieHeader = "", limit, delay = 5000 
   }
 
   // 3. Deduplicate and limit
-  const seen = new Set();
-  const uniqueVideos = rawVideos
-    .filter((video) => {
-      const key = String(video.id);
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .slice(0, limit || undefined);
+  const uniqueVideos = dedupeById(rawVideos, (v) => v.id, limit || undefined);
 
-  // 4. Map to output schema
+  // 4. Map to output schema (parseMetric returns null for unparseable, so default each to 0)
   const videos = uniqueVideos.map((video) => ({
     id: String(video.id || ""),
     title: video.caption || "",
     url: `https://www.kuaishou.com/short-video/${video.id}`,
     publishedAt: toIso(video.timestamp),
     duration: formatDuration(video.duration),
-    likes: parseMetric(video.realLikeCount ?? video.likeCount),
-    views: parseMetric(video.viewCount),
-    comments: parseMetric(video.commentCount),
+    likes: parseMetric(video.realLikeCount ?? video.likeCount) ?? 0,
+    views: parseMetric(video.viewCount) ?? 0,
+    comments: parseMetric(video.commentCount) ?? 0,
     shares: 0,
     favorites: 0,
     coins: 0,
   }));
 
-  // 5. Backfill comment counts via visionVideoComment (concurrency 4, only rows where comments === 0)
+  // 5. Backfill comment counts (only rows where comments === 0 or null)
   try {
     const backfill = await backfillComments(videos, cookieHeader, { concurrency: 4, delay });
     if (backfill.errors.length) {
@@ -557,26 +559,31 @@ export async function collect({ account, cookieHeader = "", limit, delay = 5000 
   }
 
   return {
-    account: {
+    account: buildAccountSummary({
       platform: "kuaishou",
       id: userId,
       url: profileUrl,
       name: profile.user_name || "",
-      followers: parseMetric(ownerCount.fan),
+      followers: parseMetric(ownerCount.fan) ?? 0,
       videoCount: expectedVideoCount || videos.length,
       totalLikes: videos.reduce((sum, v) => sum + v.likes, 0),
       totalViews: videos.reduce((sum, v) => sum + v.views, 0),
       totalComments: videos.reduce((sum, v) => sum + v.comments, 0),
       collectionStatus,
       warnings,
-      fetchedAt: new Date().toISOString(),
-    },
+    }),
     videos,
   };
+  } catch (error) {
+    console.log(`Kuaishou collect failed: ${error?.message || String(error)}.`);
+    return failAccount(userId, error);
+  }
 }
 
 export async function collectWithBrowser({ account, context, page, cookieHeader = "", limit = 200, delay = 3000 }) {
-  const userId = extractUserId(account);
+  let userId = "";
+  try {
+  userId = extractUserId(account);
   const profileUrl = `https://www.kuaishou.com/profile/${userId}`;
 
   const collectedVideos = new Map();
@@ -586,30 +593,9 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
   // Use GraphQL visionProfile to get the real fan/name/photo_public values when the viewer is
   // logged in. The /rest/v/profile/get endpoint returns a public "1 fan" view for non-owners
   // and is no longer authoritative.
-  try {
-    const profileData = await graphqlPost(
-      "visionProfile",
-      { userId },
-      VISION_PROFILE_QUERY,
-      profileUrl,
-      cookieHeader,
-      2,
-    );
-    const visionProfile = profileData.visionProfile || {};
-    const userProfile = visionProfile.userProfile || {};
-    const ownerCount = userProfile.ownerCount || {};
-    const profile = userProfile.profile || {};
-    if (visionProfile.result === 1) {
-      creatorName = creatorName || profile.user_name || "";
-      creatorFans = parseMetric(ownerCount.fan) || creatorFans;
-      console.log(`Kuaishou GraphQL visionProfile: fan=${ownerCount.fan ?? "?"}, name=${profile.user_name || "?"}, photo_public=${ownerCount.photo_public ?? "?"}.`);
-    } else {
-      console.log(`Kuaishou GraphQL visionProfile: result=${visionProfile.result}, falling back to REST interception.`);
-    }
-  } catch (error) {
-    console.log(`Kuaishou GraphQL visionProfile failed: ${error.message || String(error)}. Falling back to REST interception.`);
-  }
 
+  // Register response interception BEFORE navigation so we capture the profile/feed call.
+  let sawEndCursor = false;
   const responseHandler = async (response) => {
     try {
       const url = response.url();
@@ -618,7 +604,7 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
         const json = await response.json().catch(() => null);
         if (json?.result === 1 && json.fans > 0 && !creatorFans) {
           creatorName = creatorName || json.userName || "";
-          creatorFans = parseMetric(json.fans);
+          creatorFans = parseMetric(json.fans) ?? 0;
         }
       }
       if (url.includes("/rest/v/profile/feed")) {
@@ -632,12 +618,44 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
             if (!creatorName && feed.author?.name) creatorName = feed.author.name;
           }
         }
+        if (json.pcursor === "no_more") sawEndCursor = true;
       }
     } catch {}
   };
 
   page.on("response", responseHandler);
   if (context) context.on("response", responseHandler);
+
+  // Parallelize: fire GraphQL visionProfile while the page navigates. Saves ~1-2s on
+  // a typical run. We await the profile call after page.goto so the call is bounded.
+  // Track a definitive "invalid userId" or "circuit-broken" signal so we can fast-fail
+  // (skip the 10-minute login wait) instead of pretending the run succeeded.
+  let visionProfileInvalid = null;
+  const profilePromise = graphqlPost("visionProfile", { userId }, VISION_PROFILE_QUERY, profileUrl, cookieHeader, 2)
+    .then((profileData) => {
+      const visionProfile = profileData.visionProfile || {};
+      const userProfile = visionProfile.userProfile || {};
+      const ownerCount = userProfile.ownerCount || {};
+      const profile = userProfile.profile || {};
+      if (visionProfile.result === 1) {
+        creatorName = creatorName || profile.user_name || "";
+        creatorFans = parseMetric(ownerCount.fan) ?? creatorFans;
+        console.log(`Kuaishou GraphQL visionProfile: fan=${ownerCount.fan ?? "?"}, name=${profile.user_name || "?"}, photo_public=${ownerCount.photo_public ?? "?"}.`);
+      } else {
+        // Server returned a real error code (not 412/403/421, not network). The most
+        // common cause is a typo'd / banned userId; no amount of waiting helps.
+        visionProfileInvalid = new RiskControlAbort(`visionProfile result=${visionProfile.result} for userId=${userId} (likely invalid or banned)`);
+        console.log(`Kuaishou GraphQL visionProfile: result=${visionProfile.result} → marking invalid.`);
+      }
+    })
+    .catch((error) => {
+      console.log(`Kuaishou GraphQL visionProfile failed: ${error.message || String(error)}. Falling back to REST interception.`);
+      if (error?.name === "RiskControlAbort") {
+        // Circuit-breaker hit (5 consecutive 412/403/421). Don't waste 10 min waiting —
+        // the IP is banned from Kuaishou GraphQL, not the user.
+        visionProfileInvalid = error;
+      }
+    });
 
   try {
     await page.goto("https://www.kuaishou.com", { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -647,6 +665,14 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
     await page.waitForTimeout(2000);
   }
   await page.waitForTimeout(4000);
+  await profilePromise;
+
+  // Fast-fail: skip the 10-min login wait if visionProfile already proved the userId is
+  // unreachable (typo / banned) or the IP is circuit-broken. Top-level try/catch turns
+  // this into collectionStatus="failed".
+  if (visionProfileInvalid) {
+    throw visionProfileInvalid;
+  }
 
   const pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 3000) || "").catch(() => "");
   const serverError = /服务器异常|server.*error|请稍后再试/i.test(pageText);
@@ -675,20 +701,29 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
       }
     }
     if (!loggedIn) {
-      console.log("Kuaishou: login wait timed out; falling back to HTTP collection.");
-      return collect({ account, cookieHeader, limit, delay });
+      // Don't silently fall back to HTTP — that would return collectionStatus="partial"
+      // with 0 videos, a stability lie. The user wasn't logged in and the browser path
+      // can't proceed. Surface as "failed" so the caller knows the run was unproductive.
+      console.log("Kuaishou: login wait timed out; aborting.");
+      throw new RiskControlAbort(`login wait timed out after 10 min for userId=${userId}`);
     }
   }
 
   const viewport = page.viewportSize() || { width: 1280, height: 900 };
   await page.mouse.move(Math.floor(viewport.width / 2), Math.floor(viewport.height / 3)).catch(() => {});
 
+  // Break early if REST feed already returned pcursor=no_more (small accounts), or after
+  // 2 stable scrolls (down from 4). Reduces wasted scroll time on small accounts.
   const maxScrolls = Math.max(24, Math.ceil((limit || 200) / 8) + 10);
   let lastCount = 0;
   let stableScrolls = 0;
   for (let scroll = 0; scroll < maxScrolls && collectedVideos.size < (limit || 200); scroll += 1) {
     try { await page.mouse.wheel(0, 800); } catch { break; }
     try { await page.waitForTimeout(delay); } catch { break; }
+    if (sawEndCursor) {
+      console.log(`Kuaishou browser collect: REST feed returned pcursor=no_more after ${scroll + 1} scrolls (${collectedVideos.size} videos).`);
+      break;
+    }
     if (collectedVideos.size === lastCount) {
       stableScrolls += 1;
     } else {
@@ -696,7 +731,7 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
       lastCount = collectedVideos.size;
     }
     console.log(`Kuaishou browser collect: ${collectedVideos.size} video(s), scroll ${scroll + 1}/${maxScrolls}.`);
-    if (stableScrolls >= 4) break;
+    if (stableScrolls >= 2) break;
   }
 
   if (collectedVideos.size === 0) {
@@ -718,9 +753,9 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
     url: `https://www.kuaishou.com/short-video/${photo.id}`,
     publishedAt: toIso(photo.timestamp),
     duration: formatDuration(photo.duration),
-    likes: parseMetric(photo.realLikeCount ?? photo.likeCount),
-    views: parseMetric(photo.viewCount),
-    comments: parseMetric(photo.commentCount),
+    likes: parseMetric(photo.realLikeCount ?? photo.likeCount) ?? 0,
+    views: parseMetric(photo.viewCount) ?? 0,
+    comments: parseMetric(photo.commentCount) ?? 0,
     shares: 0,
     favorites: 0,
     coins: 0,
@@ -752,7 +787,7 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
   }
 
   return {
-    account: {
+    account: buildAccountSummary({
       platform: "kuaishou",
       id: userId,
       url: profileUrl,
@@ -764,8 +799,11 @@ export async function collectWithBrowser({ account, context, page, cookieHeader 
       totalComments: videos.reduce((sum, v) => sum + v.comments, 0),
       collectionStatus,
       warnings,
-      fetchedAt: new Date().toISOString(),
-    },
+    }),
     videos,
   };
+  } catch (error) {
+    console.log(`Kuaishou collectWithBrowser failed: ${error?.message || String(error)}.`);
+    return failAccount(userId, error);
+  }
 }
